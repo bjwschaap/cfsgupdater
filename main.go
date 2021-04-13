@@ -23,7 +23,7 @@ import (
 // 0 byte type..
 type void struct{}
 
-type IncomingEvent struct {
+type Event struct {
 	Records []struct {
 		EventVersion         string `json:"EventVersion"`
 		EventSubscriptionArn string `json:"EventSubscriptionArn"`
@@ -107,7 +107,7 @@ func main() {
 }
 
 // Handler handles the actual requests coming in
-func Handler(ctx context.Context, request IncomingEvent) (string, error) {
+func Handler(ctx context.Context, request Event) (string, error) {
 	// extract execution context
 	lc, _ := lambdacontext.FromContext(ctx)
 
