@@ -119,7 +119,8 @@ func Handler(ctx context.Context, request Event) (string, error) {
 	)
 	defer logger.Sync()
 
-	logger.Info("IncomingEvent",
+	// incoming event from SNS topic
+	logger.Info("incoming event",
 		zap.Any("request", request),
 		zap.String("invoked_arn", lc.InvokedFunctionArn),
 	)
