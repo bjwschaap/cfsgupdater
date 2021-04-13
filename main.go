@@ -182,7 +182,7 @@ func Handler(ctx context.Context, request Event) (string, error) {
 		)
 	}
 
-	// find security groups containing global cloudfront IPs
+	// find security groups containing regional cloudfront IPs
 	regionalSGs, err := getSecurityGroups(svc, ScopeRegional)
 	if err != nil {
 		return "ERROR", fmt.Errorf("error fetching ec2 security groups by tag: %v", err)
