@@ -1,0 +1,30 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: >-
+  This Lambda received IP Changed notifications from AWS, and updates specific tagged
+  security groups with inbound rules for all Cloudfront IP prefixes.
+Resources:
+  cfsgUpdater:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: main
+      Runtime: go1.x
+      CodeUri: .
+      MemorySize: 128
+      Timeout: 5
+      Role: >-
+        arn:aws:iam::205263487472:role/sec-atlas-UpdateCfAlbSg-LambdaExecutionRole
+      Events:
+        SNS1:
+          Type: SNS
+          Properties:
+            Topic:
+              Ref: SNSTopic1
+      Tags:
+        Owner: PACE
+        Terraform: 'true'
+        Environment: global
+        Application: security-atlas
+  SNSTopic1:
+    Type: 'AWS::SNS::Topic'

@@ -4,6 +4,12 @@
 *.dll
 *.so
 *.dylib
+main
+
+# IDEs
+.vscode
+.intellij
+.idea
 
 # Test binary, built with `go test -c`
 *.test
