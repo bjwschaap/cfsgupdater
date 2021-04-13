@@ -85,26 +85,30 @@ func (s ServiceScope) GetTags() map[string]string {
 	switch s {
 	case ScopeGlobal:
 		return map[string]string{
-			"Name":       "cloudfront_g",
+			"Name":       GLOBAL_TAG,
 			"AutoUpdate": "true",
 		}
 	case ScopeRegional:
 		return map[string]string{
-			"Name":       "cloudfront_r",
+			"Name":       REGIONAL_TAG,
 			"AutoUpdate": "true",
 		}
 	}
 	return map[string]string{}
 }
 
-var (
-	// Always set by AWS in Lambda execution environment
-	awsRegion = os.Getenv("AWS_REGION")
-
+const (
 	// Possible service names:
 	// curl -s 'https://ip-ranges.amazonaws.com/ip-ranges.json' | jq -r '.prefixes[] | .service' | sort -u
-	awsService = "CLOUDFRONT"
+	AWS_SERVICE = "CLOUDFRONT"
+
+	// Security Group tags
+	GLOBAL_TAG   = "cloudfront_g"
+	REGIONAL_TAG = "cloudfront_r"
 )
+
+// Always set by AWS in Lambda execution environment
+var AWS_REGION = os.Getenv("AWS_REGION")
 
 // Main entrypoint for our lambda
 func main() {
@@ -146,17 +150,17 @@ func Handler(ctx context.Context, request Event) (string, error) {
 	logger.Info("succesfully retrieved IP Ranges file", zap.Int("entries", len(ips.Prefixes)))
 
 	// filter cloudfront ips from total ip ranges list
-	cfRegional := ips.getIPs(awsService, ScopeRegional)
+	cfRegional := ips.getIPs(AWS_SERVICE, ScopeRegional)
 	logger.Info("selected Cloudfront regional ips",
 		zap.Int("count", len(cfRegional)),
 	)
-	cfGlobal := ips.getIPs(awsService, ScopeGlobal)
+	cfGlobal := ips.getIPs(AWS_SERVICE, ScopeGlobal)
 	logger.Info("selected Cloudfront global ips",
 		zap.Int("count", len(cfGlobal)),
 	)
 
 	// get AWS client session
-	sess, err := session.NewSession(&aws.Config{Region: aws.String(awsRegion)})
+	sess, err := session.NewSession(&aws.Config{Region: aws.String(AWS_REGION)})
 	if err != nil {
 		logger.Error("Failed to create AWS session", zap.Error(err))
 		return "ERROR", err
