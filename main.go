@@ -282,7 +282,7 @@ func getSecurityGroups(sess *ec2.EC2, scope ServiceScope) ([]*ec2.SecurityGroup,
 }
 
 // diff compares two IpRange slices and returns slice of differences
-// the returned slice contains all items that are in b, but not in a
+// the returned slice contains all items that are in b, but not in a (missing)
 func diff(a, b []*ec2.IpRange) []*ec2.IpRange {
 	// create map with length of the 'a' slice
 	ma := make(map[string]void, len(a))
