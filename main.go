@@ -98,7 +98,12 @@ func (s ServiceScope) GetTags() map[string]string {
 }
 
 var (
+	// Always set by AWS in Lambda execution environment
 	awsRegion = os.Getenv("AWS_REGION")
+
+	// Possible service names:
+	// curl -s 'https://ip-ranges.amazonaws.com/ip-ranges.json' | jq -r '.prefixes[] | .service' | sort -u
+	awsService = "CLOUDFRONT"
 )
 
 // Main entrypoint for our lambda
@@ -141,11 +146,11 @@ func Handler(ctx context.Context, request Event) (string, error) {
 	logger.Info("succesfully retrieved IP Ranges file", zap.Int("entries", len(ips.Prefixes)))
 
 	// filter cloudfront ips from total ip ranges list
-	cfRegional := ips.getIPs("CLOUDFRONT", ScopeRegional)
+	cfRegional := ips.getIPs(awsService, ScopeRegional)
 	logger.Info("selected Cloudfront regional ips",
 		zap.Int("count", len(cfRegional)),
 	)
-	cfGlobal := ips.getIPs("CLOUDFRONT", ScopeGlobal)
+	cfGlobal := ips.getIPs(awsService, ScopeGlobal)
 	logger.Info("selected Cloudfront global ips",
 		zap.Int("count", len(cfGlobal)),
 	)
