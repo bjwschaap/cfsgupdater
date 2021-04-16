@@ -9,12 +9,12 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-lambda-go/lambdacontext"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"go.uber.org/zap"
@@ -105,6 +105,14 @@ const (
 	// Security Group tags
 	GLOBAL_TAG   = "cloudfront_g"
 	REGIONAL_TAG = "cloudfront_r"
+
+	// updateSecurityGroup operations
+	AUTHORIZE = "Authorize"
+	REVOKE    = "Revoke"
+
+	// rule type
+	INGRESS = "Ingress"
+	EGRESS  = "Egress"
 )
 
 // Always set by AWS in Lambda execution environment
@@ -174,41 +182,89 @@ func Handler(ctx context.Context, request Event) (string, error) {
 	if err != nil {
 		return "ERROR", fmt.Errorf("error fetching ec2 security groups by tag: %v", err)
 	}
-	logger.Info("retrieved security groups with global CF rules", zap.Int("count", len(globalSGs)))
-	for i, s := range globalSGs {
-		logger.Info("global security group "+strconv.FormatInt(int64(i+1), 10),
-			zap.String("name", aws.StringValue(s.GroupName)),
-			zap.Int("ip_ranges", len(s.IpPermissions[0].IpRanges)),
-		)
+	if l := len(globalSGs); l != 1 {
+		return "ERROR", fmt.Errorf("expected single global security group, but found: %d", l)
 	}
+	gsg := globalSGs[0]
+	logger.Info("found security group with global CF rules",
+		zap.String("name", *gsg.GroupName),
+		zap.String("id", *gsg.GroupId),
+	)
 
 	// find security groups containing regional cloudfront IPs
 	regionalSGs, err := getSecurityGroups(svc, ScopeRegional)
 	if err != nil {
 		return "ERROR", fmt.Errorf("error fetching ec2 security groups by tag: %v", err)
 	}
-	logger.Info("retrieved security groups with regional CF rules",
-		zap.Int("count", len(regionalSGs)),
+	if l := len(regionalSGs); l != 1 {
+		return "ERROR", fmt.Errorf("expected single regional security group, but found: %d", l)
+	}
+	rsg := regionalSGs[0]
+	logger.Info("found security group with regional CF rules",
+		zap.String("name", *rsg.GroupName),
+		zap.String("id", *rsg.GroupId),
 	)
-	for i, s := range regionalSGs {
-		logger.Info("regional security group "+strconv.FormatInt(int64(i+1), 10),
-			zap.String("name", aws.StringValue(s.GroupName)),
-			zap.Int("ip_ranges", len(s.IpPermissions[0].IpRanges)),
-		)
+
+	// Check if there are any rules present (securitygroup might be empty)
+	if len(gsg.IpPermissions) == 0 {
+		gsg.IpPermissions = []*ec2.IpPermission{
+			{
+				FromPort:   aws.Int64(443),
+				ToPort:     aws.Int64(443),
+				IpProtocol: aws.String("tcp"),
+				IpRanges:   []*ec2.IpRange{},
+			},
+		}
 	}
 
-	// regional to add
-	rta := diff(regionalSGs[0].IpPermissions[0].IpRanges, cfRegional)
-	logger.Info("regional missing ip prefixes to add", zap.Int("items_to_add", len(rta)))
-	// regional to remove
-	rtr := diff(cfRegional, regionalSGs[0].IpPermissions[0].IpRanges)
-	logger.Info("regional outdated ip prefixes to remove", zap.Int("items_to_remove", len(rtr)))
-	// global to add
-	gta := diff(globalSGs[0].IpPermissions[0].IpRanges, cfGlobal)
-	logger.Info("regional missing ip prefixes to add", zap.Int("items_to_add", len(gta)))
-	// global to remove
-	gtr := diff(cfGlobal, globalSGs[0].IpPermissions[0].IpRanges)
-	logger.Info("regional outdated ip prefixes to remove", zap.Int("items_to_remove", len(gtr)))
+	if len(rsg.IpPermissions) == 0 {
+		rsg.IpPermissions = []*ec2.IpPermission{
+			{
+				FromPort:   aws.Int64(443),
+				ToPort:     aws.Int64(443),
+				IpProtocol: aws.String("tcp"),
+				IpRanges:   []*ec2.IpRange{},
+			},
+		}
+	}
+
+	// regional ingress rules to add
+	rta := diff(rsg.IpPermissions[0].IpRanges, cfRegional)
+	logger.Info("regional missing ip prefixes to add",
+		zap.Int("items_to_add", len(rta)),
+	)
+	updateSecurityGroup(logger, svc, rsg, rta, INGRESS, AUTHORIZE)
+
+	// regional ingrress rules to remove
+	rtr := diff(cfRegional, rsg.IpPermissions[0].IpRanges)
+	logger.Info("regional outdated ip prefixes to remove",
+		zap.Int("items_to_remove", len(rtr)),
+	)
+	updateSecurityGroup(logger, svc, rsg, rtr, INGRESS, REVOKE)
+
+	// global ingress rules to add
+	gta := diff(gsg.IpPermissions[0].IpRanges, cfGlobal)
+	logger.Info("regional missing ip prefixes to add",
+		zap.Int("items_to_add", len(gta)),
+	)
+	updateSecurityGroup(logger, svc, gsg, gta, INGRESS, AUTHORIZE)
+
+	// global ingress rules to remove
+	gtr := diff(cfGlobal, gsg.IpPermissions[0].IpRanges)
+	logger.Info("regional outdated ip prefixes to remove",
+		zap.Int("items_to_remove", len(gtr)),
+	)
+	updateSecurityGroup(logger, svc, gsg, gtr, INGRESS, REVOKE)
+
+	if len(gsg.IpPermissionsEgress) == 0 {
+		// No default allow-all egress found, we need to add it
+		updateSecurityGroup(logger, svc, gsg, nil, EGRESS, AUTHORIZE)
+	}
+
+	if len(rsg.IpPermissionsEgress) == 0 {
+		// No default allow-all egress found, we need to add it
+		updateSecurityGroup(logger, svc, rsg, nil, EGRESS, AUTHORIZE)
+	}
 
 	return "SUCCESS", nil
 }
@@ -312,20 +368,113 @@ func diff(a, b []*ec2.IpRange) []*ec2.IpRange {
 	return diffs
 }
 
-// func updateSecurityGroup(sess *ec2.EC2, group *ec2.SecurityGroup) {
-// 	// First empty all existing rules
-// 	sess.RevokeSecurityGroupIngress(&ec2.RevokeSecurityGroupIngressInput{
-// 		GroupId:       group.GroupId,
-// 		IpProtocol:    aws.String("tcp"),
-// 		ToPort:        aws.Int64(443),
-// 		IpPermissions: group.IpPermissions,
-// 	})
+// updateSecurityGroup stores the updated securitygroup back to AWS
+func updateSecurityGroup(_logger *zap.Logger, sess *ec2.EC2, group *ec2.SecurityGroup, ips []*ec2.IpRange, ruleType, op string) {
+	logger := _logger.WithOptions(zap.Fields(
+		zap.String("group", *group.GroupName),
+		zap.String("group_id", *group.GroupId),
+		zap.String("operation", op),
+	))
 
-// perm := []*ec2.IpPermission{}
-// group.SetIpPermissions(perm)
-// sess.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
-// 	GroupId:    group.GroupId,
-// 	IpProtocol: aws.String("tcp"),
-// 	ToPort:     aws.Int64(443),
-// })
-//}
+	if ruleType == INGRESS && len(ips) == 0 {
+		logger.Info("update security group: nothing to do")
+		return
+	}
+
+	var resString string
+	var resErr error
+	switch ruleType {
+	case INGRESS:
+		switch op {
+		case AUTHORIZE:
+			result, err := sess.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
+				GroupId: group.GroupId,
+				IpPermissions: []*ec2.IpPermission{
+					{
+						FromPort:   aws.Int64(443),
+						ToPort:     aws.Int64(443),
+						IpProtocol: aws.String("tcp"),
+						IpRanges:   ips,
+					},
+				},
+			})
+
+			resString = result.GoString()
+			resErr = err
+
+		case REVOKE:
+			result, err := sess.RevokeSecurityGroupIngress(&ec2.RevokeSecurityGroupIngressInput{
+				GroupId: group.GroupId,
+				IpPermissions: []*ec2.IpPermission{
+					{
+						FromPort:   aws.Int64(443),
+						ToPort:     aws.Int64(443),
+						IpProtocol: aws.String("tcp"),
+						IpRanges:   ips,
+					},
+				},
+			})
+
+			resString = result.GoString()
+			resErr = err
+		}
+
+	case EGRESS:
+		switch op {
+		case AUTHORIZE:
+			result, err := sess.AuthorizeSecurityGroupEgress(&ec2.AuthorizeSecurityGroupEgressInput{
+				GroupId: group.GroupId,
+				IpPermissions: []*ec2.IpPermission{
+					{
+						FromPort:   aws.Int64(0),
+						ToPort:     aws.Int64(0),
+						IpProtocol: aws.String("-1"),
+						IpRanges:   []*ec2.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
+					},
+				},
+			})
+
+			resString = result.GoString()
+			resErr = err
+
+		case REVOKE:
+			result, err := sess.RevokeSecurityGroupEgress(&ec2.RevokeSecurityGroupEgressInput{
+				GroupId: group.GroupId,
+				IpPermissions: []*ec2.IpPermission{
+					{
+						FromPort:   aws.Int64(0),
+						ToPort:     aws.Int64(0),
+						IpProtocol: aws.String("-1"),
+						IpRanges:   []*ec2.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
+					},
+				},
+			})
+
+			resString = result.GoString()
+			resErr = err
+		}
+	}
+
+	if resErr != nil {
+		if aerr, ok := resErr.(awserr.Error); ok {
+			switch aerr.Code() {
+			default:
+				logger.Error("error setting new permissions on security group",
+					zap.String("code", aerr.Code()),
+					zap.String("message", aerr.Message()),
+					zap.Error(aerr),
+				)
+				return
+			}
+		} else {
+			logger.Error("error setting new permissions on security group",
+				zap.Error(resErr),
+			)
+			return
+		}
+	}
+
+	logger.Info("succesfully updated security group",
+		zap.String("aws_ec2_response", resString),
+	)
+}
