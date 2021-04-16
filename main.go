@@ -85,13 +85,13 @@ func (s ServiceScope) GetTags() map[string]string {
 	switch s {
 	case ScopeGlobal:
 		return map[string]string{
-			"Name":       GLOBAL_TAG,
-			"AutoUpdate": "true",
+			"SecurityGroupType": GLOBAL_TAG,
+			"AutoUpdate":        "true",
 		}
 	case ScopeRegional:
 		return map[string]string{
-			"Name":       REGIONAL_TAG,
-			"AutoUpdate": "true",
+			"SecurityGroupType": REGIONAL_TAG,
+			"AutoUpdate":        "true",
 		}
 	}
 	return map[string]string{}
@@ -182,91 +182,63 @@ func Handler(ctx context.Context, request Event) (string, error) {
 	if err != nil {
 		return "ERROR", fmt.Errorf("error fetching ec2 security groups by tag: %v", err)
 	}
-	if l := len(globalSGs); l != 1 {
-		return "ERROR", fmt.Errorf("expected single global security group, but found: %d", l)
+
+	// update all global groups
+	for _, gsg := range globalSGs {
+		processGroup(logger, svc, gsg, cfGlobal)
 	}
-	gsg := globalSGs[0]
-	logger.Info("found security group with global CF rules",
-		zap.String("name", *gsg.GroupName),
-		zap.String("id", *gsg.GroupId),
-	)
 
 	// find security groups containing regional cloudfront IPs
 	regionalSGs, err := getSecurityGroups(svc, ScopeRegional)
 	if err != nil {
 		return "ERROR", fmt.Errorf("error fetching ec2 security groups by tag: %v", err)
 	}
-	if l := len(regionalSGs); l != 1 {
-		return "ERROR", fmt.Errorf("expected single regional security group, but found: %d", l)
-	}
-	rsg := regionalSGs[0]
-	logger.Info("found security group with regional CF rules",
-		zap.String("name", *rsg.GroupName),
-		zap.String("id", *rsg.GroupId),
-	)
 
-	// Check if there are any rules present (securitygroup might be empty)
-	if len(gsg.IpPermissions) == 0 {
-		gsg.IpPermissions = []*ec2.IpPermission{
-			{
-				FromPort:   aws.Int64(443),
-				ToPort:     aws.Int64(443),
-				IpProtocol: aws.String("tcp"),
-				IpRanges:   []*ec2.IpRange{},
-			},
-		}
-	}
-
-	if len(rsg.IpPermissions) == 0 {
-		rsg.IpPermissions = []*ec2.IpPermission{
-			{
-				FromPort:   aws.Int64(443),
-				ToPort:     aws.Int64(443),
-				IpProtocol: aws.String("tcp"),
-				IpRanges:   []*ec2.IpRange{},
-			},
-		}
-	}
-
-	// regional ingress rules to add
-	rta := diff(rsg.IpPermissions[0].IpRanges, cfRegional)
-	logger.Info("regional missing ip prefixes to add",
-		zap.Int("items_to_add", len(rta)),
-	)
-	updateSecurityGroup(logger, svc, rsg, rta, INGRESS, AUTHORIZE)
-
-	// regional ingrress rules to remove
-	rtr := diff(cfRegional, rsg.IpPermissions[0].IpRanges)
-	logger.Info("regional outdated ip prefixes to remove",
-		zap.Int("items_to_remove", len(rtr)),
-	)
-	updateSecurityGroup(logger, svc, rsg, rtr, INGRESS, REVOKE)
-
-	// global ingress rules to add
-	gta := diff(gsg.IpPermissions[0].IpRanges, cfGlobal)
-	logger.Info("regional missing ip prefixes to add",
-		zap.Int("items_to_add", len(gta)),
-	)
-	updateSecurityGroup(logger, svc, gsg, gta, INGRESS, AUTHORIZE)
-
-	// global ingress rules to remove
-	gtr := diff(cfGlobal, gsg.IpPermissions[0].IpRanges)
-	logger.Info("regional outdated ip prefixes to remove",
-		zap.Int("items_to_remove", len(gtr)),
-	)
-	updateSecurityGroup(logger, svc, gsg, gtr, INGRESS, REVOKE)
-
-	if len(gsg.IpPermissionsEgress) == 0 {
-		// No default allow-all egress found, we need to add it
-		updateSecurityGroup(logger, svc, gsg, nil, EGRESS, AUTHORIZE)
-	}
-
-	if len(rsg.IpPermissionsEgress) == 0 {
-		// No default allow-all egress found, we need to add it
-		updateSecurityGroup(logger, svc, rsg, nil, EGRESS, AUTHORIZE)
+	// update all regional groups
+	for _, rsg := range regionalSGs {
+		processGroup(logger, svc, rsg, cfRegional)
 	}
 
 	return "SUCCESS", nil
+}
+
+// processGroup updates a single securitygroup
+func processGroup(_logger *zap.Logger, svc *ec2.EC2, grp *ec2.SecurityGroup, ips []*ec2.IpRange) {
+	logger := _logger.WithOptions(zap.Fields(
+		zap.String("group_name", *grp.GroupName),
+		zap.String("group_id", *grp.GroupId),
+	))
+
+	// Check if there are any rules present (securitygroup might be empty)
+	if len(grp.IpPermissions) == 0 {
+		grp.IpPermissions = []*ec2.IpPermission{
+			{
+				FromPort:   aws.Int64(443),
+				ToPort:     aws.Int64(443),
+				IpProtocol: aws.String("tcp"),
+				IpRanges:   []*ec2.IpRange{},
+			},
+		}
+	}
+
+	// ingress rules to add
+	add := diff(grp.IpPermissions[0].IpRanges, ips)
+	logger.Info("missing ip prefixes to add",
+		zap.Int("items_to_add", len(add)),
+	)
+	updateSecurityGroup(logger, svc, grp, add, INGRESS, AUTHORIZE)
+
+	// ingress rules to remove
+	remove := diff(ips, grp.IpPermissions[0].IpRanges)
+	logger.Info("outdated ip prefixes to remove",
+		zap.Int("items_to_remove", len(remove)),
+	)
+	updateSecurityGroup(logger, svc, grp, remove, INGRESS, REVOKE)
+
+	if len(grp.IpPermissionsEgress) == 0 {
+		// No default allow-all egress found, we need to add it
+		updateSecurityGroup(logger, svc, grp, nil, EGRESS, AUTHORIZE)
+	}
 }
 
 // getIPList retrieves the IP ranges file published by AWS,
@@ -374,6 +346,7 @@ func updateSecurityGroup(_logger *zap.Logger, sess *ec2.EC2, group *ec2.Security
 		zap.String("group", *group.GroupName),
 		zap.String("group_id", *group.GroupId),
 		zap.String("operation", op),
+		zap.String("type", ruleType),
 	))
 
 	if ruleType == INGRESS && len(ips) == 0 {
