@@ -2,109 +2,22 @@ package main
 
 import (
 	"context"
-	"crypto/md5"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net/http"
 	"os"
-	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-lambda-go/lambdacontext"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"go.uber.org/zap"
 )
 
-// 0 byte type..
-type void struct{}
-
-type Event struct {
-	Records []struct {
-		EventVersion         string `json:"EventVersion"`
-		EventSubscriptionArn string `json:"EventSubscriptionArn"`
-		EventSource          string `json:"EventSource"`
-		Sns                  struct {
-			SignatureVersion string    `json:"SignatureVersion"`
-			Timestamp        time.Time `json:"Timestamp"`
-			Signature        string    `json:"Signature"`
-			SigningCertURL   string    `json:"SigningCertUrl"`
-			MessageID        string    `json:"MessageId"`
-			Message          string    `json:"Message"`
-			Type             string    `json:"Type"`
-			UnsubscribeURL   string    `json:"UnsubscribeUrl"`
-			TopicArn         string    `json:"TopicArn"`
-			Subject          string    `json:"Subject"`
-		} `json:"Sns"`
-	} `json:"Records"`
-}
-
-type Message struct {
-	CreateTime string `json:"create-time"`
-	Synctoken  string `json:"synctoken"`
-	MD5        string `json:"md5"`
-	URL        string `json:"url"`
-}
-
-type IPList struct {
-	SyncToken  string `json:"syncToken"`
-	CreateDate string `json:"createDate"`
-	Prefixes   []struct {
-		IPPrefix           string `json:"ip_prefix"`
-		Region             string `json:"region"`
-		Service            string `json:"service"`
-		NetworkBorderGroup string `json:"network_border_group"`
-	} `json:"prefixes"`
-}
-
-type ServiceScope string
-
-const (
-	ScopeGlobal   = ServiceScope("GLOBAL")
-	ScopeRegional = ServiceScope("REGION")
-	ScopeAll      = ServiceScope("ALL")
-)
-
-func (s ServiceScope) IsGlobal() bool {
-	return s == ScopeGlobal
-}
-
-func (s ServiceScope) IsRegional() bool {
-	return s == ScopeRegional
-}
-
-func (s ServiceScope) IsAll() bool {
-	return s == ScopeAll
-}
-
-func (s ServiceScope) GetTags() map[string]string {
-	switch s {
-	case ScopeGlobal:
-		return map[string]string{
-			"SecurityGroupType": GLOBAL_TAG,
-			"AutoUpdate":        "true",
-		}
-	case ScopeRegional:
-		return map[string]string{
-			"SecurityGroupType": REGIONAL_TAG,
-			"AutoUpdate":        "true",
-		}
-	}
-	return map[string]string{}
-}
-
 const (
 	// Possible service names:
 	// curl -s 'https://ip-ranges.amazonaws.com/ip-ranges.json' | jq -r '.prefixes[] | .service' | sort -u
 	AWS_SERVICE = "CLOUDFRONT"
-
-	// Security Group tags
-	GLOBAL_TAG   = "cloudfront_g"
-	REGIONAL_TAG = "cloudfront_r"
 
 	// updateSecurityGroup operations
 	AUTHORIZE = "Authorize"
@@ -155,7 +68,9 @@ func Handler(ctx context.Context, request Event) (string, error) {
 	if err != nil {
 		return "ERROR", err
 	}
-	logger.Info("succesfully retrieved IP Ranges file", zap.Int("entries", len(ips.Prefixes)))
+	logger.Info("succesfully retrieved IP Ranges file",
+		zap.Int("entries", len(ips.Prefixes)),
+	)
 
 	// filter cloudfront ips from total ip ranges list
 	cfRegional := ips.getIPs(AWS_SERVICE, ScopeRegional)
@@ -241,84 +156,6 @@ func processGroup(_logger *zap.Logger, svc *ec2.EC2, grp *ec2.SecurityGroup, ips
 	}
 }
 
-// getIPList retrieves the IP ranges file published by AWS,
-// and verifies it against the (in message) published md5 hash
-func getIPList(url, hash string) (IPList, error) {
-	ipList := IPList{}
-
-	resp, err := http.DefaultClient.Get(url)
-	if err != nil {
-		return ipList, err
-	}
-	defer resp.Body.Close()
-
-	rawJSON, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return ipList, fmt.Errorf("failed to read http response: %v", err)
-	}
-
-	h := md5.New()
-	h.Write(rawJSON)
-	sum := hex.EncodeToString(h.Sum(nil))
-	if hash != sum {
-		return ipList, fmt.Errorf("checksum (MD5) mismatch. Got: %s Expected: %s", sum, hash)
-	}
-
-	err = json.Unmarshal(rawJSON, &ipList)
-	if err != nil {
-		return ipList, fmt.Errorf("failed to parse ip ranges data: %v", err)
-	}
-
-	return ipList, nil
-}
-
-// getIPs takes the IPList and returns a new slice with filtered ip prefixes.
-func (ips *IPList) getIPs(service string, scope ServiceScope) []*ec2.IpRange {
-	// holds all ips
-	var result []*ec2.IpRange
-
-	for _, p := range ips.Prefixes {
-		if (scope.IsAll() && p.Service == service) ||
-			(scope.IsRegional() && p.Region != "GLOBAL" && p.Service == service) ||
-			(scope.IsGlobal() && p.Region == "GLOBAL" && p.Service == service) {
-			// convert IPPrefix entry to a ec2 IpRange that our security group understands
-			// also, it will make comparing IpRanges much easier later on..
-			result = append(result, &ec2.IpRange{CidrIp: aws.String(p.IPPrefix)})
-		}
-	}
-
-	return result
-}
-
-// getSecurityGroups retrieves securitygroups by their tags
-// tags are defined through the requested scope
-func getSecurityGroups(sess *ec2.EC2, scope ServiceScope) ([]*ec2.SecurityGroup, error) {
-	// f is our filter definition
-	f := []*ec2.Filter{}
-
-	// append filter tag key/value pair for each entry in tags map
-	for k, v := range scope.GetTags() {
-		f = append(f,
-			&ec2.Filter{
-				Name:   aws.String("tag-key"),
-				Values: aws.StringSlice([]string{k}),
-			},
-			&ec2.Filter{
-				Name:   aws.String("tag-value"),
-				Values: aws.StringSlice([]string{v}),
-			},
-		)
-	}
-
-	// get securitygroups using filter
-	res, err := sess.DescribeSecurityGroups(&ec2.DescribeSecurityGroupsInput{Filters: f})
-	if err != nil {
-		return nil, err
-	}
-
-	return res.SecurityGroups, nil
-}
-
 // diff compares two IpRange slices and returns slice of differences
 // the returned slice contains all items that are in b, but not in a (missing)
 func diff(a, b []*ec2.IpRange) []*ec2.IpRange {
@@ -338,116 +175,4 @@ func diff(a, b []*ec2.IpRange) []*ec2.IpRange {
 		}
 	}
 	return diffs
-}
-
-// updateSecurityGroup stores the updated securitygroup back to AWS
-func updateSecurityGroup(_logger *zap.Logger, sess *ec2.EC2, group *ec2.SecurityGroup, ips []*ec2.IpRange, ruleType, op string) {
-	logger := _logger.WithOptions(zap.Fields(
-		zap.String("group", *group.GroupName),
-		zap.String("group_id", *group.GroupId),
-		zap.String("operation", op),
-		zap.String("type", ruleType),
-	))
-
-	if ruleType == INGRESS && len(ips) == 0 {
-		logger.Info("update security group: nothing to do")
-		return
-	}
-
-	var resString string
-	var resErr error
-	switch ruleType {
-	case INGRESS:
-		switch op {
-		case AUTHORIZE:
-			result, err := sess.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
-				GroupId: group.GroupId,
-				IpPermissions: []*ec2.IpPermission{
-					{
-						FromPort:   aws.Int64(443),
-						ToPort:     aws.Int64(443),
-						IpProtocol: aws.String("tcp"),
-						IpRanges:   ips,
-					},
-				},
-			})
-
-			resString = result.GoString()
-			resErr = err
-
-		case REVOKE:
-			result, err := sess.RevokeSecurityGroupIngress(&ec2.RevokeSecurityGroupIngressInput{
-				GroupId: group.GroupId,
-				IpPermissions: []*ec2.IpPermission{
-					{
-						FromPort:   aws.Int64(443),
-						ToPort:     aws.Int64(443),
-						IpProtocol: aws.String("tcp"),
-						IpRanges:   ips,
-					},
-				},
-			})
-
-			resString = result.GoString()
-			resErr = err
-		}
-
-	case EGRESS:
-		switch op {
-		case AUTHORIZE:
-			result, err := sess.AuthorizeSecurityGroupEgress(&ec2.AuthorizeSecurityGroupEgressInput{
-				GroupId: group.GroupId,
-				IpPermissions: []*ec2.IpPermission{
-					{
-						FromPort:   aws.Int64(0),
-						ToPort:     aws.Int64(0),
-						IpProtocol: aws.String("-1"),
-						IpRanges:   []*ec2.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
-					},
-				},
-			})
-
-			resString = result.GoString()
-			resErr = err
-
-		case REVOKE:
-			result, err := sess.RevokeSecurityGroupEgress(&ec2.RevokeSecurityGroupEgressInput{
-				GroupId: group.GroupId,
-				IpPermissions: []*ec2.IpPermission{
-					{
-						FromPort:   aws.Int64(0),
-						ToPort:     aws.Int64(0),
-						IpProtocol: aws.String("-1"),
-						IpRanges:   []*ec2.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
-					},
-				},
-			})
-
-			resString = result.GoString()
-			resErr = err
-		}
-	}
-
-	if resErr != nil {
-		if aerr, ok := resErr.(awserr.Error); ok {
-			switch aerr.Code() {
-			default:
-				logger.Error("error setting new permissions on security group",
-					zap.String("code", aerr.Code()),
-					zap.String("message", aerr.Message()),
-					zap.Error(aerr),
-				)
-				return
-			}
-		} else {
-			logger.Error("error setting new permissions on security group",
-				zap.Error(resErr),
-			)
-			return
-		}
-	}
-
-	logger.Info("succesfully updated security group",
-		zap.String("aws_ec2_response", resString),
-	)
 }
